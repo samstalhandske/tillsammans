@@ -12,7 +12,10 @@ import "core:time"
 import "core:strings"
 import "core:strconv"
 
+import sh "../shared"
+
 // TODO: SS - Add timestamp to server.
+// TODO: SS - Add generic struct so users can use that in each Connection.
 
 MAX_RECV_SIZE :: 1024
 
@@ -50,9 +53,12 @@ Protocol :: enum {
 }
 
 Connection_ID :: distinct u32
+
 Connection :: struct {
 	socket: net.Any_Socket,
 	disconnect_reason: Disconnect_Reason,
+
+	// TODO: SS - Add timestamp for when it was born.
 }
 
 Server :: struct($T: typeid) {
@@ -119,7 +125,7 @@ create_server :: proc(spec: Specification($T)) -> (^Server(T), Create_Server_Res
 		return nil, .Invalid_Tickrate
 	}
 
-	endpoint, get_endpoint_result := try_get_endpoint(spec.ip, spec.port)
+	endpoint, get_endpoint_result := sh.try_get_endpoint(spec.ip, spec.port)
 	if get_endpoint_result != .OK {
 		fmt.eprintfln("Error! %v.", get_endpoint_result)
 		return nil, .Failed_To_Get_Endpoint
@@ -274,12 +280,16 @@ start_server :: proc(server: $T/^Server) -> Start_Server_Result {
 						case .TCP: {
 							b, recv_err := net.recv_tcp(connection.socket.(net.TCP_Socket), buffer[:])
 							if recv_err != nil {
-								if recv_err == .Would_Block {
-									// No data received.
+								#partial switch recv_err {
+									case .Would_Block: {}
+									case .Connection_Closed: {
+										disconnect_connection(server, connection_id, Disconnect_Self {})
+									}
+									case: {
+										server_log_error(server, fmt.tprintf("Failed to receive data, error: %v", recv_err))
+									}
 								}
-								else {
-									server_log_error(server, fmt.tprintf("Failed to receive data, error: %v", recv_err))
-								}
+								
 								continue
 							}
 
@@ -290,10 +300,8 @@ start_server :: proc(server: $T/^Server) -> Start_Server_Result {
 						}
 					}
 
-					
 					received := buffer[:bytes_received]
 					if len(received) == 0 {
-						// kick_client(server, &client, .Sent_No_Data)
 						server_log_error(
 							server,
 							fmt.tprintf(
@@ -337,10 +345,6 @@ start_server :: proc(server: $T/^Server) -> Start_Server_Result {
 			}
 
 			last_tick_time := time.tick_now()
-
-			if should_check_if_proceed(server) {
-				proceed_to_next_tick(server, &current_tick)
-			}
 
 			for server_alive(server) {
 				{ // Disconnect connections that are on their way out.
@@ -409,11 +413,7 @@ stop_server :: proc(server: $T/^Server) {
 
 	server_log(server, "Stopping server ...")
 
-	switch server.protocol {
-		case .TCP: net.close(server.socket.(net.TCP_Socket))
-		case .UDP: net.close(server.socket.(net.UDP_Socket))
-	}
-
+	net.close(server.socket)
 	server.running = false
 
 	if server.stop_callback != nil {
@@ -421,10 +421,7 @@ stop_server :: proc(server: $T/^Server) {
 	}
 
 	for c_id, conn in server.connection_map {
-		switch server.protocol {
-			case .TCP: net.close(conn.socket.(net.TCP_Socket))
-			case .UDP: net.close(conn.socket.(net.UDP_Socket))
-		}
+		net.close(conn.socket)
 	}
 	clear(&server.connection_map)
 
@@ -444,6 +441,8 @@ destroy_server :: proc(server: $T/^Server) {
 
 	delete(server.name)
 	delete(server.connection_map)
+
+	free(server)
 
 	server^ = {}
 }
@@ -516,85 +515,6 @@ try_run_command :: proc(server: $T/^Server, input: string) -> Command_Result {
 	}
 
 	return cmd(server, split_result[1:])
-
-	// switch cmd {
-	//     case "kick": {
-	//         if len(server.connected_clients) == 0 {
-	//             fmt.eprintln("No one to kick.")
-	//             break
-	//         }
-
-	//         if len(split_result) != 2 {
-	//             fmt.eprintfln("Expected 2 arguments, got %v.", len(split_result))
-	//             fmt.eprintfln("kick <socket>")
-	//             break
-	//         }
-
-	//         id_to_kick, ok := strconv.parse_i64(split_result[1])
-	//         if !ok {
-	//             fmt.eprintfln("Failed to kick because we failed to parse argument '%v' as an i64.", split_result[1])
-	//             break
-	//         }
-
-	//         socket_to_kick := net.TCP_Socket(id_to_kick)
-
-	//         if socket_to_kick not_in server.connected_clients {
-	//             fmt.eprintfln("Socket '%v' not found in list of clients.", socket_to_kick)
-	//             break
-	//         }
-
-	//         kick_client(&server, socket_to_kick, .Admin_Command)
-	//     }
-	//     case "send": {
-	//         if len(server.connected_clients) == 0 {
-	//             fmt.eprintln("No one to send string to.")
-	//             break
-	//         }
-
-	//         if len(split_result) < 3 {
-	//             fmt.eprintfln("Expected 3+ arguments, got %v.", len(split_result))
-	//             fmt.eprintfln("send <socket> <string>")
-	//             break
-	//         }
-
-	//         socket_i64, ok := strconv.parse_i64(split_result[1])
-	//         if !ok {
-	//             fmt.eprintfln("Failed to parse argument '%v' as an i64.", split_result[1])
-	//             break
-	//         }
-
-	//         socket_to_send_data_to := net.TCP_Socket(socket_i64)
-
-	//         if socket_to_send_data_to not_in server.connected_clients {
-	//             fmt.eprintfln("Socket '%v' not found in list of clients.", socket_to_send_data_to)
-	//             break
-	//         }
-
-	//         if !server_send(&server, socket_to_send_data_to, split_result[2:]) {
-	//             // ..
-	//         }
-	//     }
-	//     case: {
-	//         fmt.eprintfln("Unknown command '%v'.", split_result[0])
-	//     }
-	// }
-}
-
-@(private="file") Try_Get_Endpoint_Result :: enum {
-	OK,
-	Failed_To_Parse_IP_Address,
-}
-
-@(private="file") try_get_endpoint :: proc(ip_str: string, port: u16) -> (net.Endpoint, Try_Get_Endpoint_Result) {
-	ip_addr, parse_ip_ok := net.parse_ip4_address(ip_str)
-	if !parse_ip_ok {
-		return {}, .Failed_To_Parse_IP_Address
-	}
-
-	return net.Endpoint {
-		address = ip_addr,
-		port = int(port),
-	}, .OK
 }
 
 get_server_name_with_ip_port :: proc(server: $T/^Server) -> string {
@@ -609,68 +529,6 @@ server_log :: proc(server: $T/^Server, text: string) {
 server_log_error :: proc(server: $T/^Server, text: string, loc := #caller_location) {
 	fmt.printfln("%v ERROR! %v ~ %v", fmt.tprintf("TILLSAMMANS %v >>", get_server_name_with_ip_port(server)), loc, text)
 }
-
-
-
-// Two_Way_Map :: struct($A, $B: typeid) {
-// 	a_to_b: map[A]B,
-// 	b_to_a: map[B]A,
-// }
-
-// add_to_two_way_map :: proc(m: ^Two_Way_Map($A, $B), a: A, b: B) {
-// 	assert(a not_in m.a_to_b)
-// 	assert(b not_in m.b_to_a)
-
-// 	m.a_to_b[a] = b
-// 	m.b_to_a[b] = a
-// }
-
-// get_from_two_way_map :: proc {
-// 	get_a_from_two_way_map,
-// 	get_b_from_two_way_map,   
-// }
-// get_a_from_two_way_map :: proc(m: ^Two_Way_Map($A, $B), b: B) -> (A, bool) {
-// 	return m.b_to_a[b]
-// }
-// get_b_from_two_way_map :: proc(m: ^Two_Way_Map($A, $B), a: A) -> (B, bool) {
-// 	return m.a_to_b[a]
-// }
-
-// remove_from_two_way_map :: proc {
-// 	remove_a_from_two_way_map,
-// 	remove_b_from_two_way_map,
-// }
-// remove_a_from_two_way_map :: proc(m: ^Two_Way_Map($A, $B), a: A) {
-// 	assert(a in m.a_to_b)
-
-// 	b := m.a_to_b[a]
-	
-// 	delete_key(&m.a_to_b, a)
-// 	delete_key(&m.b_to_a, b)
-// }
-// remove_b_from_two_way_map :: proc(m: ^Two_Way_Map($A, $B), b: B) {
-// 	assert(b in m.b_to_a)
-
-// 	a := m.b_to_a[b]
-	
-// 	delete_key(&m.b_to_a, b)
-// 	delete_key(&m.a_to_b, a)
-// }
-
-// clear_two_way_map :: proc(m: ^Two_Way_Map($A, $B)) {
-// 	clear(&m.a_to_b)
-// 	clear(&m.b_to_a)
-// }
-
-// make_two_way_map :: proc(m: ^Two_Way_Map($A, $B), cap: u32) {
-// 	m.a_to_b = make(map[A]B, cap)
-// 	m.b_to_a = make(map[B]A, cap)
-// }
-
-// destroy_two_way_map :: proc(m: ^Two_Way_Map($A, $B)) {
-// 	delete(m.a_to_b)
-// 	delete(m.b_to_a)
-// }
 
 Disconnect_Reason :: union {
 	Disconnect_Self,
