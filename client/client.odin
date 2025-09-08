@@ -26,6 +26,8 @@ Client :: struct {
 	send_queue: queue.Queue([]u8),
 
 	receive_thread, send_thread: ^thread.Thread,
+
+	on_receive_bytes_from_server: proc([]u8),
 }
 
 Create_Client_Result :: enum {
@@ -34,18 +36,22 @@ Create_Client_Result :: enum {
 	Failed_To_Connect,
 }
 
-create_client :: proc(ip: string, port: u16) -> (^Client, Create_Client_Result) {
+create_client :: proc(ip: string, port: u16, on_receive_bytes_from_server: proc([]u8),) -> (^Client, Create_Client_Result) {
 	endpoint, get_endpoint_result := sh.try_get_endpoint(ip, port)
 	if get_endpoint_result != .OK {
 		fmt.eprintfln("Error! %v.", get_endpoint_result)
 		return nil, .Failed_To_Get_Endpoint
 	}
 
+	
+	assert(on_receive_bytes_from_server != nil)
+	
 	client := new(Client)
 	client^ = {
 		endpoint = endpoint,
+		on_receive_bytes_from_server = on_receive_bytes_from_server,
 	}
-
+	
 	queue.init(&client.send_queue)
 	
 	return client, .OK
@@ -74,7 +80,7 @@ start_client :: proc(client: ^Client) -> Start_Client_Result {
 	{ // Set up threads.
 		assert(client.receive_thread == nil)
 		client.receive_thread = thread.create_and_start_with_poly_data(client, proc(client: ^Client) {
-			fmt.printfln("Receive-thread active.")
+			// fmt.printfln("Receive-thread active.")
 
 			buffer: [256]u8
 				
@@ -89,14 +95,20 @@ start_client :: proc(client: ^Client) -> Start_Client_Result {
 					break
 				}
 
+				if bytes_received == 0 {
+					client.should_stop = true
+					break
+				}
+
 				received := buffer[:bytes_received]
-				fmt.printfln("Client received %d bytes: %s", len(received), string(received))
+				assert(client.on_receive_bytes_from_server != nil)
+				client.on_receive_bytes_from_server(received)
 			}
 		})
 
 		assert(client.send_thread == nil)
 		client.send_thread = thread.create_and_start_with_poly_data(client, proc(client: ^Client) {
-			fmt.printfln("Send-thread active.")
+			// fmt.printfln("Send-thread active.")
 
 			for client_alive(client) {
 				sync.atomic_mutex_lock(&client.mutex)
@@ -119,7 +131,7 @@ start_client :: proc(client: ^Client) -> Start_Client_Result {
 					}
 	
 					sent := data[:bytes_sent]
-					fmt.printfln("Client sent %d bytes: %s", len(sent), string(sent))
+					// fmt.printfln("Client sent %d bytes: %s", len(sent), string(sent))
 				}
 			}
 		})

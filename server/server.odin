@@ -43,7 +43,7 @@ Specification :: struct($T: typeid) {
 	// Callbacks.
 	server_created_callback, server_started_callback, server_stopped_callback: proc(^Server(T)),
 	server_received_bytes_callback: proc(^Server(T), Connection_ID, []u8),
-	server_connection_joined: proc(^Server(T), Connection_ID),
+	server_connection_joined, server_connection_disconnected: proc(^Server(T), Connection_ID),
 	server_tick_callback: proc(^Server(T), Tick),
 }
 
@@ -88,7 +88,7 @@ Server :: struct($T: typeid) {
 	start_callback, stop_callback: proc(^Server(T)),
 	on_received_bytes_callback: proc(^Server(T), Connection_ID, []u8),
 	tick_callback: proc(^Server(T), Tick),
-	on_connection_joined: proc(^Server(T), Connection_ID),
+	on_connection_joined, on_connection_disconnected: proc(^Server(T), Connection_ID),
 
 	// Threads.
 	listen_thread, message_thread, tick_thread: ^thread.Thread,
@@ -155,6 +155,7 @@ create_server :: proc(spec: Specification($T)) -> (^Server(T), Create_Server_Res
 		stop_callback    			= spec.server_stopped_callback,
 		on_received_bytes_callback 	= spec.server_received_bytes_callback,
 		on_connection_joined 		= spec.server_connection_joined,
+		on_connection_disconnected  = spec.server_connection_disconnected,
 		tick_callback 				= spec.server_tick_callback,
 	}
 
@@ -358,28 +359,10 @@ start_server :: proc(server: $T/^Server) -> Start_Server_Result {
 					}
 					for id in ids_to_kick[:counter] {
 						conn := &server.connection_map[id]
-
-						bye_msg := ""
-						switch &r in conn.disconnect_reason {
-							case Disconnect_Self: {
-								bye_msg = "Disconnected.\n"
-							}
-							case Disconnect_Kick: {
-								switch r.reason {
-									case .Idle: {
-										bye_msg = "Kicked! Idle too long.\n"
-									}
-									case .Cheating: {
-										bye_msg = "Kicked! Cheating.\n"
-									}
-								}
-							}
+						
+						if server.on_connection_disconnected != nil {
+							server.on_connection_disconnected(server, id)
 						}
-
-						send_bye_result := send_bytes_to_socket(conn.socket, transmute([]u8)bye_msg)
-						assert(send_bye_result == .OK)
-
-						// TODO: SS - If we want the connection to get the 'bye' message we might have to 'sleep' for a bit before closing the socket.
 						
 						net.close(conn.socket)
 						delete_key(&server.connection_map, id)
@@ -469,6 +452,12 @@ send_bytes_to_connection_id :: proc(server: $T/^Server, id: Connection_ID, data:
 		case .TCP_Error: {
 			server_log_error(server, fmt.tprintf("Failed to send %v bytes to socket %v from server.", len(data), socket))
 		}
+	}
+}
+
+send_bytes_to_all_connections :: proc(server: $T/^Server, data: []u8) {
+	for conn_id in server.connection_map {
+		send_bytes_to_connection_id(server, conn_id, data)
 	}
 }
 
