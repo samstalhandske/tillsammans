@@ -5,14 +5,17 @@ package client
 
 import "core:fmt"
 import "core:net"
+import "core:bytes"
 import "core:os"
 import "core:sync"
 import "core:thread"
 import "core:container/queue"
+import "core:c/libc"
 
 import sh "../shared"
 
 SEND_BUFFER_SIZE :: 1024
+MAX_RECV_SIZE :: 1024
 
 Client :: struct {
 	endpoint: net.Endpoint,
@@ -42,7 +45,6 @@ create_client :: proc(ip: string, port: u16, on_receive_bytes_from_server: proc(
 		fmt.eprintfln("Error! %v.", get_endpoint_result)
 		return nil, .Failed_To_Get_Endpoint
 	}
-
 	
 	assert(on_receive_bytes_from_server != nil)
 	
@@ -80,12 +82,60 @@ start_client :: proc(client: ^Client) -> Start_Client_Result {
 	{ // Set up threads.
 		assert(client.receive_thread == nil)
 		client.receive_thread = thread.create_and_start_with_poly_data(client, proc(client: ^Client) {
-			// fmt.printfln("Receive-thread active.")
+			// buffer: [4096]u8
+			// data_len: int = 0
 
-			buffer: [256]u8
+			// for client_alive(client) {
+			// 	n, err := net.recv_tcp(client.socket.(net.TCP_Socket), buffer[data_len:])
+			// 	if err != nil {
+			// 		if err == .Connection_Closed {
+			// 			client.should_stop = true
+			// 			break
+			// 		}
+			// 		fmt.printfln("Failed to receive data, error: %v", err)
+			// 		break
+			// 	}
+
+			// 	if n == 0 {
+			// 		client.should_stop = true
+			// 		break
+			// 	}
+
+			// 	data_len += n
+			// 	read_offset: int = 0
 				
+			// 	reader: bytes.Reader
+			// 	bytes.reader_init(&reader, buffer[:])
+
+			// 	for data_len - read_offset >= 4 {
+			// 		msg_len := sh.deserialize_u32_le(&reader)
+
+			// 		if data_len - read_offset < 4 + int(msg_len) {
+			// 			break
+			// 		}
+
+			// 		message := buffer[read_offset+4 : read_offset+4+int(msg_len)]
+			// 		assert(client.on_receive_bytes_from_server != nil)
+			// 		client.on_receive_bytes_from_server(message)
+
+			// 		read_offset += 4 + int(msg_len)
+			// 	}
+
+			// 	if read_offset > 0 {
+			// 		remaining := data_len - read_offset
+			// 		for i in 0..<remaining {
+			// 			buffer[i] = buffer[read_offset + i]
+			// 			buffer[read_offset + i] = {}
+			// 		}
+			// 		data_len = remaining
+			// 	}
+			// }
+
+			buffer: [4096]u8
+			data_len: int = 0
+
 			for client_alive(client) {
-				bytes_received, err := net.recv_tcp(client.socket.(net.TCP_Socket), buffer[:])
+				n, err := net.recv_tcp(client.socket.(net.TCP_Socket), buffer[data_len:])
 				if err != nil {
 					if err == .Connection_Closed {
 						client.should_stop = true
@@ -95,14 +145,38 @@ start_client :: proc(client: ^Client) -> Start_Client_Result {
 					break
 				}
 
-				if bytes_received == 0 {
+				if n == 0 {
 					client.should_stop = true
 					break
 				}
 
-				received := buffer[:bytes_received]
-				assert(client.on_receive_bytes_from_server != nil)
-				client.on_receive_bytes_from_server(received)
+				data_len += n
+				read_offset: int = 0
+
+				for data_len - read_offset >= 4 {
+					reader: bytes.Reader
+					bytes.reader_init(&reader, buffer[read_offset:read_offset+4])
+					msg_len := sh.deserialize_u32_le(&reader)
+
+					if data_len - read_offset < 4 + int(msg_len) {
+						break
+					}
+
+					message := buffer[read_offset+4 : read_offset+4+int(msg_len)]
+					assert(client.on_receive_bytes_from_server != nil)
+					client.on_receive_bytes_from_server(message)
+
+					read_offset += 4 + int(msg_len)
+				}
+
+				// Flytta kvarvarande data till början av bufferten
+				if read_offset > 0 {
+					remaining := data_len - read_offset
+					if remaining > 0 {
+						libc.memmove(rawptr(&buffer[0]), rawptr(&buffer[read_offset]), uint(remaining))
+					}
+					data_len = remaining
+				}
 			}
 		})
 
@@ -130,7 +204,7 @@ start_client :: proc(client: ^Client) -> Start_Client_Result {
 						break
 					}
 	
-					sent := data[:bytes_sent]
+					// sent := data[:bytes_sent]
 					// fmt.printfln("Client sent %d bytes: %s", len(sent), string(sent))
 				}
 			}
@@ -145,10 +219,11 @@ stop_client :: proc(client: ^Client) {
 	assert(client.connected)
 	assert(client.socket != {})
 
+	client.should_stop = true
 	client.connected = false
 
-	thread.destroy(client.send_thread)
-	thread.destroy(client.receive_thread)
+	thread.join(client.send_thread)
+	thread.join(client.receive_thread)
 	client.send_thread = nil
 	client.receive_thread = nil
 

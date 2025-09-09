@@ -4,18 +4,15 @@
 package server
 
 import "core:container/avl"
-import "core:log"
+import "core:bytes"
 import "core:fmt"
 import "core:net"
 import "core:thread"
 import "core:time"
 import "core:strings"
-import "core:strconv"
+import "core:sync"
 
 import sh "../shared"
-
-// TODO: SS - Add timestamp to server.
-// TODO: SS - Add generic struct so users can use that in each Connection.
 
 MAX_RECV_SIZE :: 1024
 
@@ -28,7 +25,6 @@ Tick_Mode :: enum {
 
 Specification :: struct($T: typeid) {
 	name: string,
-
 	protocol: Protocol,
 	ip: string,
 	port: u16,
@@ -40,7 +36,6 @@ Specification :: struct($T: typeid) {
 
 	commands: map[string]proc(server: ^Server(T), args: []string) -> Command_Result,
 
-	// Callbacks.
 	server_created_callback, server_started_callback, server_stopped_callback: proc(^Server(T)),
 	server_received_bytes_callback: proc(^Server(T), Connection_ID, []u8),
 	server_connection_joined, server_connection_disconnected: proc(^Server(T), Connection_ID),
@@ -57,45 +52,98 @@ Connection_ID :: distinct u32
 Connection :: struct {
 	socket: net.Any_Socket,
 	disconnect_reason: Disconnect_Reason,
-
-	// TODO: SS - Add timestamp for when it was born.
 }
 
 Server :: struct($T: typeid) {
 	name: string,
-
 	protocol: Protocol,
 	endpoint: net.Endpoint,
 	socket: net.Any_Socket,
 
 	tickrate: u8,
 	tick_mode: Tick_Mode,
-	
+
 	running: bool,
 	should_stop: bool,
 
-	data: T, // NOTE: SS - Could add 'using' here but I think it's better to be explicit here.
+	mutex: sync.Atomic_Mutex,
 
+	data: T,
 	commands: map[string]proc(server: ^Server(T), args: []string) -> Command_Result,
 
 	max_connections: u32,
 	next_connection_id: Connection_ID,
 	connection_map: map[Connection_ID]Connection,
 
-	connection_ids_to_disconnect: [dynamic]Connection_ID,
+	incoming_queue: Message_Queue(Incoming_Message),
+	outgoing_queue: Message_Queue(Outgoing_Message),
+	control_queue_from_tick: Message_Queue(Control_Message),
+	events_for_tick_queue: Message_Queue(Server_Event),
 
-	// Callbacks.
 	start_callback, stop_callback: proc(^Server(T)),
 	on_received_bytes_callback: proc(^Server(T), Connection_ID, []u8),
 	tick_callback: proc(^Server(T), Tick),
 	on_connection_joined, on_connection_disconnected: proc(^Server(T), Connection_ID),
 
-	// Threads.
-	listen_thread, message_thread, tick_thread: ^thread.Thread,
+	listen_thread, tick_thread: ^thread.Thread,
 }
 
-server_alive :: proc(server: $T/^Server) -> bool {
-	return server.running && !server.should_stop
+Message_Queue :: struct($T: typeid) {
+	mutex: sync.Atomic_Mutex,
+	items: [dynamic]T,
+}
+
+message_queue_push :: proc($T: typeid, q: ^Message_Queue(T), item: T) {
+	sync.atomic_mutex_lock(&q.mutex)
+	defer sync.atomic_mutex_unlock(&q.mutex)
+	append(&q.items, item)
+}
+
+message_queue_drain :: proc($T: typeid, q: ^Message_Queue(T), out: ^[dynamic]T) {
+	sync.atomic_mutex_lock(&q.mutex)
+	defer sync.atomic_mutex_unlock(&q.mutex)
+	out^ = q.items
+	clear(&q.items)
+}
+
+Incoming_Message :: struct {
+	connection_id: Connection_ID,
+	data: []u8,
+}
+
+Outgoing_Message :: struct {
+	connection_id: Connection_ID,
+	data: []u8,
+}
+
+Control_Message :: union {
+	Disconnect_Message,
+}
+Server_Event :: union {
+	Join_Message,
+	Disconnect_Message,
+}
+Join_Message :: struct {
+	connection_id: Connection_ID,
+}
+Disconnect_Message :: struct {
+	connection_id: Connection_ID,
+}
+
+Disconnect_Reason :: union {
+	Disconnect_Self,
+	Disconnect_Kick,
+}
+
+Disconnect_Self :: struct {}
+
+Kick_Reason :: enum {
+	Idle,
+	Cheating,
+	// ..
+}
+Disconnect_Kick :: struct {
+	reason: Kick_Reason,
 }
 
 Create_Server_Result :: enum {
@@ -107,20 +155,18 @@ Create_Server_Result :: enum {
 	Invalid_Tickrate,
 }
 
-create_server :: proc(spec: Specification($T)) -> (^Server(T), Create_Server_Result) { // TODO: SS - Move some stuff out of the specification-struct and add them as normal parameters.
+create_server :: proc(spec: Specification($T)) -> (^Server(T), Create_Server_Result) {
 	assert(spec.protocol == .TCP, "Only TCP allowed at the moment.")
 
 	if spec.max_connections == 0 {
 		return nil, .Max_Connections_Needs_To_Be_Bigger_Than_Zero
 	}
-
 	if spec.server_received_bytes_callback == nil {
 		return nil, .Unimplemented_Callback_Received_Bytes
 	}
 	if spec.server_tick_callback == nil {
 		return nil, .Unimplemented_Callback_Tick
 	}
-
 	if spec.tickrate == 0 {
 		return nil, .Invalid_Tickrate
 	}
@@ -138,33 +184,24 @@ create_server :: proc(spec: Specification($T)) -> (^Server(T), Create_Server_Res
 
 	server := new(Server(T))
 	server^ = {
-		name             = strings.clone(server_name),
-		protocol         = spec.protocol,
-		endpoint         = endpoint,
-
-		tickrate		 = spec.tickrate,
-		tick_mode		 = spec.tick_mode,
-
-		data             = T {},
-
-		commands         = spec.commands,
-
-		max_connections  = spec.max_connections,
-
-		start_callback   			= spec.server_started_callback,
-		stop_callback    			= spec.server_stopped_callback,
-		on_received_bytes_callback 	= spec.server_received_bytes_callback,
-		on_connection_joined 		= spec.server_connection_joined,
-		on_connection_disconnected  = spec.server_connection_disconnected,
-		tick_callback 				= spec.server_tick_callback,
+		name = strings.clone(server_name),
+		protocol = spec.protocol,
+		endpoint = endpoint,
+		tickrate = spec.tickrate,
+		tick_mode = spec.tick_mode,
+		data = T{},
+		commands = spec.commands,
+		max_connections = spec.max_connections,
+		start_callback = spec.server_started_callback,
+		stop_callback = spec.server_stopped_callback,
+		on_received_bytes_callback = spec.server_received_bytes_callback,
+		on_connection_joined = spec.server_connection_joined,
+		on_connection_disconnected = spec.server_connection_disconnected,
+		tick_callback = spec.server_tick_callback,
 	}
 
-	assert(server.on_received_bytes_callback != nil)
-	assert(server.tick_callback != nil)
-
 	server.connection_map = make(map[Connection_ID]Connection, server.max_connections)
-	server.connection_ids_to_disconnect = make([dynamic]Connection_ID, 0, server.max_connections)
-	
+
 	if spec.server_created_callback != nil {
 		spec.server_created_callback(server)
 	}
@@ -179,307 +216,252 @@ Start_Server_Result :: enum {
 }
 
 start_server :: proc(server: $T/^Server) -> Start_Server_Result {
-	assert(server != nil)
-	assert(!server.running)
-	
-	server_log(server, "Starting server ...")
-	
-	socket, socket_err := net.listen_tcp(server.endpoint)
-	if socket_err != nil {
-		server_log_error(server, fmt.tprintf("%v.", socket_err))
+	socket, err := net.listen_tcp(server.endpoint)
+	if err != nil {
+		server_log_error(server, fmt.tprintf("Failed to listen: %v", err))
 		return .Failed_To_Listen
 	}
-
 	server.socket = socket
-
-	set_blocking_err := net.set_blocking(server.socket, false)
-	if set_blocking_err != nil {
-		server_log_error(server, fmt.tprintf("Failed to set socket to non-blocking, error: %v.", set_blocking_err))
+	set_block_err := net.set_blocking(socket, false)
+	if set_block_err != .None {
 		return .Failed_To_Set_Non_Blocking
 	}
-
 	server.running = true
 
-	if server.start_callback != nil {
-		server.start_callback(server)
-	}
+	if server.start_callback != nil { server.start_callback(server) }
 
-	server_log(server, "Started server.")
+	server_log(server, "Server started.")
 
-	{ // Set up threads.
-		// TODO: SS - Decide if we should only 'create' them in create_server and start them here, or if this is good enough.
+	// Start threads.
+	start_io_thread(server)
+	start_tick_thread(server)
 
-		assert(server.listen_thread == nil)
-		server.listen_thread = thread.create_and_start_with_poly_data(server, proc(server: T) {
-			server_log(server, "Listen-thread active.") 
-			
-			for server_alive(server) {
-				#partial switch server.protocol {
-					case .TCP: {
-						client_socket, _, accept_err := net.accept_tcp(server.socket.(net.TCP_Socket))
-						if accept_err != nil {
-							if accept_err == .Would_Block {
-								continue
-							}
-
-							server_log_error(server, fmt.tprintf("Failed to accept new connection, error: %v.", accept_err))
-							continue
-						}
-
-						connections_count := u32(len(server.connection_map))
-						if connections_count >= server.max_connections {
-							server_log(server, fmt.tprintf("Failed to accept new connection, server is full (%v/%v).", connections_count, server.max_connections))
-
-							sorry_msg := "Server is full, sorry! :(\n."
-							send_sorry_result := send_bytes_to_socket(client_socket, transmute([]u8)sorry_msg)
-							assert(send_sorry_result == .OK)
-							
-							net.close(client_socket)
-							
-							continue
-						}
-
-						// TODO: SS - Ask the user-program whether we should accept or decline this client.
-
-						server_log(server, fmt.tprintf("Accepted client, socket: %v.", client_socket))
-						net.set_blocking(client_socket, should_block = false)
-
-						connection_id := server.next_connection_id
-						defer server.next_connection_id += 1
-						assert(connection_id not_in server.connection_map)
-						server.connection_map[connection_id] = Connection {
-							socket = client_socket,
-						}
-
-						if server.on_connection_joined != nil {
-							server.on_connection_joined(server, connection_id)
-						}
-					}
-					case: {
-						assert(false)
-					}
-				}
-				
-			}
-		})
-
-		assert(server.message_thread == nil)
-		server.message_thread = thread.create_and_start_with_poly_data(server, proc(server: T) {
-			server_log(server, "Message-thread active.") 
-			
-			for server_alive(server) {
-				buffer: [MAX_RECV_SIZE]u8
-		
-				for connection_id, connection in server.connection_map {
-					if connection.disconnect_reason != nil {
-						// Skip connections that are leaving.
-						continue
-					}
-					
-					bytes_received := 0
-					#partial switch server.protocol {
-						case .TCP: {
-							b, recv_err := net.recv_tcp(connection.socket.(net.TCP_Socket), buffer[:])
-							if recv_err != nil {
-								#partial switch recv_err {
-									case .Would_Block: {}
-									case .Connection_Closed: {
-										disconnect_connection(server, connection_id, Disconnect_Self {})
-									}
-									case: {
-										server_log_error(server, fmt.tprintf("Failed to receive data, error: %v", recv_err))
-									}
-								}
-								
-								continue
-							}
-
-							bytes_received = b
-						}
-						case: {
-							assert(false)
-						}
-					}
-
-					received := buffer[:bytes_received]
-					if len(received) == 0 {
-						server_log_error(
-							server,
-							fmt.tprintf(
-								"Received 0 bytes from connection id %v (socket: %v), kick.",
-								connection_id, connection.socket,
-							)
-						)
-
-						disconnect_connection(server, connection_id, Disconnect_Self {})
-						continue
-					}
-						
-					server_log(server, fmt.tprintf("Received %v bytes.", len(received)))
-					server.on_received_bytes_callback(server, connection_id, received)
-				}
-			}
-		})
-
-		assert(server.tick_thread == nil)
-		server.tick_thread = thread.create_and_start_with_poly_data(server, proc(server: T) {
-			server_log(server, "Tick-thread active.")
-
-			current_tick: Tick
-			tick_interval := 1000 / f64(Tick(server.tickrate)) // ms per tick.
-
-			should_check_if_proceed :: proc(server: $T/^Server) -> bool {
-				switch server.tick_mode {
-					case .Always: {}
-					case .Only_When_Has_Connections: {
-						if len(server.connection_map) == 0 {
-							return false
-						}
-					}
-				}
-
-				return true
-			}
-			proceed_to_next_tick :: proc(server: $T/^Server, current_tick: ^Tick) {
-				server.tick_callback(server, current_tick^)
-				current_tick^ += 1
-			}
-
-			last_tick_time := time.tick_now()
-
-			for server_alive(server) {
-				{ // Disconnect connections that are on their way out.
-					ids_to_kick: [max(u8)]Connection_ID
-					counter := 0
-					for c_id, connection in &server.connection_map {
-						if connection.disconnect_reason != nil {
-							ids_to_kick[counter] = c_id
-							counter += 1
-						}
-					}
-					for id in ids_to_kick[:counter] {
-						conn := &server.connection_map[id]
-						
-						if server.on_connection_disconnected != nil {
-							server.on_connection_disconnected(server, id)
-						}
-						
-						net.close(conn.socket)
-						delete_key(&server.connection_map, id)
-					}
-				}
-				
-				if !should_check_if_proceed(server) {
-					time.sleep(100)
-					continue
-				}
-				
-				now := time.tick_now()
-				elapsed := time.tick_diff(last_tick_time, now)
-
-				if time.duration_milliseconds(elapsed) >= tick_interval {
-					proceed_to_next_tick(server, &current_tick)
-					last_tick_time = time.tick_now()
-				} else {
-					time.sleep(1)
-				}
-			}
-		})
-	}
-	
 	return .OK
 }
 
 stop_server :: proc(server: $T/^Server) {
 	assert(server != nil)
-	assert(server.running)
-
-	server_log(server, "Stopping server ...")
-
-	net.close(server.socket)
 	server.running = false
 
-	if server.stop_callback != nil {
-		server.stop_callback(server)
-	}
-
-	for c_id, conn in server.connection_map {
+	net.close(server.socket)
+	for id, conn in server.connection_map {
 		net.close(conn.socket)
 	}
 	clear(&server.connection_map)
 
+	// Stop threads.
 	thread.destroy(server.listen_thread)
-	thread.destroy(server.message_thread)
 	thread.destroy(server.tick_thread)
-	server.listen_thread  = nil
-	server.message_thread = nil
+	server.listen_thread = nil
 	server.tick_thread = nil
 
-	server_log(server, "Stopped server.")
+	if server.stop_callback != nil { server.stop_callback(server) }
+
+	server_log(server, "Server stopped.")
 }
 
-destroy_server :: proc(server: $T/^Server) {
-	assert(server != nil)
-	assert(!server.running)
-
-	delete(server.name)
-	delete(server.connection_map)
-
-	free(server)
-
-	server^ = {}
-}
-
-send_bytes_to_connection_id :: proc(server: $T/^Server, id: Connection_ID, data: []u8) {
-	conn, ok := &server.connection_map[id]
-	if !ok {
-		server_log_error(server, fmt.tprintf("Failed to send bytes to connection id %v, not found in map.", id))
-		return
-	}
-
-	
-	if len(data) == 0 {
-		server_log_error(server, fmt.tprintf("Failed to send bytes to connection id %v, length of data is 0.", id))
-		return
-	}
-	
-	socket := conn.socket
-	send_result := send_bytes_to_socket(conn.socket, data)
-	switch send_result {
-		case .OK: {
-			server_log(server, fmt.tprintf("Sent %v bytes to connection id %v (socket: %v).", len(data), id, socket))
-		}
-		case .TCP_Error: {
-			server_log_error(server, fmt.tprintf("Failed to send %v bytes to socket %v from server.", len(data), socket))
-		}
-	}
+send_bytes_to_connection :: proc(server: $T/^Server, id: Connection_ID, data: []u8) {
+	data_copy := make([]u8, len(data))
+	copy(data_copy, data)
+	message_queue_push(Outgoing_Message, &server.outgoing_queue, Outgoing_Message{ connection_id = id, data = data_copy })
 }
 
 send_bytes_to_all_connections :: proc(server: $T/^Server, data: []u8) {
-	for conn_id in server.connection_map {
-		send_bytes_to_connection_id(server, conn_id, data)
+	for id in server.connection_map {
+		send_bytes_to_connection(server, id, data)
 	}
 }
 
-Send_Bytes_To_Socket_Result :: enum {
-	OK,
-	TCP_Error,
+get_server_name_with_ip_port :: proc(server: $T/^Server) -> string {
+	assert(server != nil)
+	return fmt.tprintf("'%v' (%v)", server.name, net.endpoint_to_string(server.endpoint))
 }
-send_bytes_to_socket :: proc(socket: net.Any_Socket, data: []u8) -> Send_Bytes_To_Socket_Result {
-	#partial switch &s in socket {
-		case net.TCP_Socket: {
-			bytes_sent, err_send := net.send_tcp(s, data)
-			if err_send != nil {
-				fmt.eprintfln("Send error! %v", err_send)
-				return .TCP_Error
+
+server_log :: proc(server: $T/^Server, text: string) {
+	fmt.printfln("[SERVER %v] %v", get_server_name_with_ip_port(server), text)
+}
+
+server_log_error :: proc(server: $T/^Server, text: string) {
+	fmt.printfln("[SERVER %v] ERROR: %v", get_server_name_with_ip_port(server), text)
+}
+
+start_io_thread :: proc(server: $T/^Server) {
+	assert(server.listen_thread == nil)
+
+	server.listen_thread = thread.create_and_start_with_poly_data(server, proc(server: T) {
+		server_log(server, "IO-thread active.")
+
+		buffer: [MAX_RECV_SIZE]u8
+
+		for server.running {
+			client_socket, _, err := net.accept_tcp(server.socket.(net.TCP_Socket))
+			if err == nil {
+				connections_count := u32(len(server.connection_map))
+				if connections_count >= server.max_connections {
+					server_log(server, fmt.tprintf("Server full, rejecting client."))
+					// TODO: SS - Send 'Server_Full' message.
+					net.close(client_socket)
+					continue
+				}
+
+				connection_id := server.next_connection_id
+				defer server.next_connection_id += 1
+
+				sync.atomic_mutex_lock(&server.mutex)
+				server.connection_map[connection_id] = Connection {
+					socket = client_socket
+				}
+				sync.atomic_mutex_unlock(&server.mutex)
+
+				message_queue_push(Server_Event, &server.events_for_tick_queue, Join_Message {
+					connection_id = connection_id
+				})
+
+				server_log(server, fmt.tprintf("Accepted client %v.", connection_id))
+				net.set_blocking(client_socket, false)
+			}
+
+			for connection_id, conn in server.connection_map {
+				if conn.disconnect_reason != nil {
+					continue
+				}
+
+				n, recv_err := net.recv_tcp(conn.socket.(net.TCP_Socket), buffer[:])
+				if recv_err != nil {
+					if recv_err == .Would_Block {
+						continue
+					}
+					
+					if recv_err == .Connection_Closed || recv_err == .Invalid_Argument {
+						message_queue_push(Control_Message, &server.control_queue_from_tick, Disconnect_Message {
+							connection_id = connection_id
+						})
+						continue
+					}
+
+					server_log_error(server, fmt.tprintf("Recv error: %v", recv_err))
+					continue
+				}
+
+				if n == 0 {
+					message_queue_push(Control_Message, &server.control_queue_from_tick, Disconnect_Message {
+						connection_id = connection_id
+					})
+					continue
+				}
+
+				if n > 0 {
+					recv_copy := make([]u8, n)
+					copy(recv_copy, buffer[:n])
+					message_queue_push(Incoming_Message, &server.incoming_queue, Incoming_Message{connection_id, recv_copy})
+				}
+			}
+
+			{
+				outgoing_msgs: [dynamic]Outgoing_Message
+				message_queue_drain(Outgoing_Message, &server.outgoing_queue, &outgoing_msgs)
+
+				buf: bytes.Buffer
+				bytes.buffer_init_allocator(&buf, 0, 1024)
+				for msg in outgoing_msgs {
+					conn, ok := server.connection_map[msg.connection_id]
+					assert(ok)
+					if len(msg.data) > 0 {
+						sh.serialize_tcp_message(&buf, sh.to_tcp_message(msg.data))
+						bytes_written, err := net.send_tcp(conn.socket.(net.TCP_Socket), bytes.buffer_to_bytes(&buf))
+						assert(err == .None, fmt.tprintf("Got err %v when sending %v bytes to %v.", err, len(msg.data), msg.connection_id))
+					}
+				}
+
+				bytes.buffer_destroy(&buf)
+				
+				time.sleep(1)
 			}
 		}
-		case: {
-			assert(false)
-		}
-	}
+	})
+}
 
-	return .OK	
+start_tick_thread :: proc(server: $T/^Server) {
+	assert(server.tick_thread == nil)
+
+	server.tick_thread = thread.create_and_start_with_poly_data(server, proc(server: T) {
+		server_log(server, "Tick-thread active.")
+
+		current_tick: Tick = 0
+		tick_interval := 1.0 / f64(server.tickrate)
+		last_tick := time.tick_now()
+
+		for server.running {
+			tick_now := time.tick_now()
+			elapsed := time.duration_seconds(time.tick_diff(last_tick, tick_now))
+
+			switch server.tick_mode {
+				case .Always: {}
+				case .Only_When_Has_Connections: {
+					if len(server.connection_map) == 0 {
+						continue
+					}
+				}
+			}
+
+			if elapsed >= tick_interval {
+				last_tick = tick_now
+
+				control_msgs: [dynamic]Control_Message
+				message_queue_drain(Control_Message, &server.control_queue_from_tick, &control_msgs)
+				for msg in control_msgs {
+					switch &m in msg {
+						case Disconnect_Message: {
+							conn, ok := server.connection_map[m.connection_id]
+							if ok {
+								net.close(conn.socket)
+
+								sync.atomic_mutex_lock(&server.mutex)
+								delete_key(&server.connection_map, m.connection_id)
+								sync.atomic_mutex_unlock(&server.mutex)
+
+								message_queue_push(Server_Event, &server.events_for_tick_queue, Disconnect_Message {
+									connection_id = m.connection_id
+								})
+							}
+						}
+					}
+				}
+
+				incoming_msgs: [dynamic]Incoming_Message
+				message_queue_drain(Incoming_Message, &server.incoming_queue, &incoming_msgs)
+				for msg in incoming_msgs {
+					server.on_received_bytes_callback(server, msg.connection_id, msg.data)
+				}
+
+				events: [dynamic]Server_Event
+				message_queue_drain(Server_Event, &server.events_for_tick_queue, &events)
+				for event in events {
+					switch &e in event {
+						case Join_Message: {
+							if server.on_connection_joined != nil {
+								server.on_connection_joined(server, e.connection_id)
+							}
+						}
+						case Disconnect_Message: {
+							if server.on_connection_disconnected != nil {
+								server.on_connection_disconnected(server, e.connection_id)
+							}
+						}
+					}
+				}
+
+				server.tick_callback(server, current_tick)
+				current_tick += 1
+			} else {
+				time.sleep(1)
+			}
+		}
+	})
+}
+
+server_alive :: proc(server: $T/^Server) -> bool {
+	return server.running && !server.should_stop
 }
 
 Command_Result :: enum {
@@ -506,43 +488,14 @@ try_run_command :: proc(server: $T/^Server, input: string) -> Command_Result {
 	return cmd(server, split_result[1:])
 }
 
-get_server_name_with_ip_port :: proc(server: $T/^Server) -> string {
+destroy_server :: proc(server: $T/^Server) {
 	assert(server != nil)
-	return fmt.tprintf("'%v' (%v)", server.name, net.endpoint_to_string(server.endpoint))
-}
+	assert(!server.running)
 
-server_log :: proc(server: $T/^Server, text: string) {
-	fmt.printfln("%v %v", fmt.tprintf("TILLSAMMANS %v >>", get_server_name_with_ip_port(server)), text)
-}
+	delete(server.name)
+	delete(server.connection_map)
 
-server_log_error :: proc(server: $T/^Server, text: string, loc := #caller_location) {
-	fmt.printfln("%v ERROR! %v ~ %v", fmt.tprintf("TILLSAMMANS %v >>", get_server_name_with_ip_port(server)), loc, text)
-}
+	free(server)
 
-Disconnect_Reason :: union {
-	Disconnect_Self,
-	Disconnect_Kick,
-}
-
-Disconnect_Self :: struct {
-}
-
-Kick_Reason :: enum {
-	Idle,
-	Cheating,
-	// ..
-}
-Disconnect_Kick :: struct {
-	reason: Kick_Reason,
-}
-
-disconnect_connection :: proc(server: $T/^Server, id: Connection_ID, reason: Disconnect_Reason) {	
-	connection, ok := &server.connection_map[id]
-	assert(ok)
-	if connection.disconnect_reason != nil {
-		server_log_error(server, fmt.tprintf("Failed to disconnect connection id %v cause it's already on it's way out. (%v)", id, connection.disconnect_reason))
-		return
-	}
-
-	connection.disconnect_reason = reason
+	server^ = {}
 }
